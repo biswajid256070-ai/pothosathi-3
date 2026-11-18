@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>দৃষ্টি সহায়ক</title>
+<style>
+  :root { --bg:#000; --fg:#ffe600; --muted:#c9c9c9; --alert:#ff4d4d; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; user-select:none; }
+  html, body { height:100%; margin:0; }
+  body { background:var(--bg); color:var(--fg); font-family:"Noto Sans Bengali", system-ui, sans-serif; display:flex; flex-direction:column; touch-action:manipulation; }
+  #top { padding:calc(env(safe-area-inset-top,0px) + 12px) 16px 0; text-align:right; }
+  #openSettings { background:#222; color:var(--muted); border:1px solid #555; border-radius:10px; padding:10px 16px; font-size:1rem; font-family:inherit; }
+  #stage { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:24px; text-align:center; gap:20px; }
+  #status { font-size:2.4rem; font-weight:700; line-height:1.3; }
+  #answer { font-size:1.5rem; color:#fff; line-height:1.5; max-height:40vh; overflow:auto; }
+  #help { padding:12px 20px calc(env(safe-area-inset-bottom,0px) + 16px); color:var(--muted); font-size:1rem; text-align:center; line-height:1.6; }
+  #settings { display:none; position:fixed; inset:0; background:#111; color:#fff; padding:calc(env(safe-area-inset-top,0px) + 20px) 20px 20px; overflow:auto; z-index:5; }
+  #settings.open { display:block; }
+  #settings label { display:block; margin:16px 0 6px; font-size:1.1rem; }
+  #settings input { width:100%; padding:12px; font-size:1.1rem; border-radius:10px; border:1px solid #666; background:#000; color:#fff; user-select:text; }
+  #settings button { margin-top:20px; width:100%; padding:14px; font-size:1.1rem; border:0; border-radius:12px; background:var(--fg); color:#000; font-family:inherit; font-weight:700; }
+  #settings .note { color:var(--muted); font-size:.95rem; margin-top:8px; }
+  video, canvas { display:none; }
+  .alert { color:var(--alert) !important; }
+</style>
+</head>
+<body>
+<div id="top"><button id="openSettings" aria-label="সেটিংস (অভিভাবকের জন্য)">সেটিংস</button></div>
+<div id="stage" aria-live="polite">
+  <div id="status">কথা বলতে স্ক্রিনে দুইবার ট্যাপ করুন</div>
+  <div id="answer"></div>
+</div>
+<div id="help">দুইবার ট্যাপ: কথা বলুন<br>বলুন "টাকা চেক" বা "সামনে কী আছে?"<br>বিপদে: স্ক্রিন চেপে ধরে রাখুন (SOS)</div>
+
+<div id="settings">
+  <h2>সেটিংস</h2>
+  <label for="apiKey">Gemini API Key</label>
+  <input id="apiKey" type="password" autocomplete="off">
+  <label for="model">মডেলের নাম</label>
+  <input id="model" type="text" autocomplete="off">
+  <label for="guardian">অভিভাবকের ফোন নম্বর</label>
+  <input id="guardian" type="tel" placeholder="017XXXXXXXX">
+  <button id="save">সংরক্ষণ করুন</button>
+  <p class="note">এই সেটিংস শুধু এই ফোনেই থাকবে। সেটআপ অভিভাবক বা সহায়ক করে দেবেন।</p>
+</div>
+
+<video id="cam" playsinline muted></video>
+<canvas id="snap"></canvas>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var statusEl = $('status'), answerEl = $('answer');
+  var DEFAULT_MODEL = 'gemini-2.5-flash';
+  var busy = false;
+
+  function load(k, d) { try { return localStorage.getItem(k) || d; } catch (e) { return d; } }
+  function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+
+  /* ---------- কথা বলা (TTS) ---------- */
+  function speak(text, cb) {
+    try {
+      speechSynthesis.cancel();
+      var u = new SpeechSynthesisUtterance(text);
+      u.lang = 'bn-BD';
+      u.rate = 0.95;
+      u.onend = function () { if (cb) cb(); };
+      u.onerror = function () { if (cb) cb(); };
+      speechSynthesis.speak(u);
+    } catch (e) { if (cb) cb(); }
+  }
+  function show(msg, ans, isAlert) {
+    statusEl.textContent = msg;
+    statusEl.classList.toggle('alert', !!isAlert);
+    answerEl.textContent = ans || '';
+  }
+  function buzz(p) { try { navigator.vibrate && navigator.vibrate(p); } catch (e) {} }
+
+  /* ---------- ক্যামেরা ---------- */
+  function takePhoto() {
+    return navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false })
+      .then(function (stream) {
+        var v = $('cam');
+        v.srcObject = stream;
+        return v.play().then(function () {
+          return new Promise(function (r) { setTimeout(r, 800); });
+        }).then(function () {
+          var c = $('snap');
+          var w = v.videoWidth, h = v.videoHeight;
+          var scale = Math.min(1, 900 / Math.max(w, h));
+          c.width = Math.round(w * scale);
+          c.height = Math.round(h * scale);
+          c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+          stream.getTracks().forEach(function (t) { t.stop(); });
+          return c.toDataURL('image/jpeg', 0.8).split(',')[1];
+        });
+      });
+  }
+
+  /* ---------- Gemini ---------- */
+  function askGemini(b64, prompt) {
+    var key = load('apiKey', '');
+    var model = load('model', DEFAULT_MODEL);
+    if (!key) return Promise.reject(new Error('NOKEY'));
+    var url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key);
+    var body = {
+      contents: [{ parts: [
+        { inline_data: { mime_type: 'image/jpeg', data: b64 } },
+        { text: prompt }
+      ] }]
+    };
+    return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (d) {
+        var p = d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts;
+        if (!p || !p.length) throw new Error('EMPTY');
+        return p.map(function (x) { return x.text || ''; }).join(' ').trim();
+      });
+  }
+
+  /* ---------- কমান্ড বোঝা ---------- */
+  function buildPrompt(cmd) {
+    var base = 'তুমি একজন দৃষ্টিপ্রতিবন্ধী ব্যক্তির সহায়ক। শুধু সহজ বাংলায়, সর্বোচ্চ তিনটি ছোট বাক্যে উত্তর দাও। কোনো চিহ্ন বা তালিকা ব্যবহার করবে না। ';
+    if (/টাকা|নোট|ট্যাকা/.test(cmd)) {
+      return base + 'ছবিতে বাংলাদেশি টাকার নোট থাকলে প্রতিটি নোটের মান বলো এবং মোট কত টাকা তা বলো। নিশ্চিত না হলে স্পষ্ট বলো যে নিশ্চিত নও এবং আবার ছবি তুলতে বলো।';
+    }
+    if (/সামনে|বাধা|বাধা|রাস্তা|কী আছে|কি আছে/.test(cmd)) {
+      return base + 'ছবিতে সামনে কী আছে বর্ণনা করো। বিশেষ করে বাধা, সিঁড়ি, গর্ত, গাড়ি বা মানুষ থাকলে কোন দিকে এবং কত কাছে তা বলো। নিশ্চিত না হলে সেটা জানাও।';
+    }
+    return base + 'ব্যবহারকারী বলেছেন: "' + cmd + '"। ছবি দেখে এর উত্তর দাও।';
+  }
+
+  function handleCommand(cmd) {
+    busy = true;
+    show('ছবি তুলছি, অপেক্ষা করুন', '');
+    speak('ছবি তুলছি');
+    buzz(80);
+    takePhoto()
+      .then(function (b64) {
+        show('বিশ্লেষণ করছি', '');
+        return askGemini(b64, buildPrompt(cmd));
+      })
+      .then(function (text) {
+        show('উত্তর', text);
+        speak(text, function () { busy = false; show('আবার কথা বলতে দুইবার ট্যাপ করুন', text); });
+      })
+      .catch(function (e) {
+        var m = 'দুঃখিত, কাজটি করা যায়নি। আবার চেষ্টা করুন।';
+        if (e && e.message === 'NOKEY') m = 'এপিআই কী দেওয়া হয়নি। অভিভাবককে সেটিংসে কী দিতে বলুন।';
+        else if (e && e.name === 'NotAllowedError') m = 'ক্যামেরার অনুমতি দেওয়া হয়নি।';
+        else if (e && /HTTP/.test(e.message)) m = 'ইন্টারনেট বা এপিআই কী ঠিক নেই। আবার চেষ্টা করুন।';
+        show('ত্রুটি', m, true);
+        speak(m, function () { busy = false; });
+      });
+  }
+
+  /* ---------- শোনা (Speech Recognition) ---------- */
+  function listen() {
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      var m = 'এই ফোনে কণ্ঠস্বর চেনা সুবিধা নেই।';
+      show('ত্রুটি', m, true); speak(m); return;
+    }
+    busy = true;
+    speechSynthesis.cancel();
+    buzz(60);
+    var rec = new SR();
+    rec.lang = 'bn-BD';
+    rec.interimResults = false;
+    rec.maxAlternatives = 1;
+    var got = false;
+    show('বলুন, আমি শুনছি', '');
+    rec.onresult = function (ev) {
+      got = true;
+      var t = ev.results[0][0].transcript;
+      show('শুনলাম: ' + t, '');
+      handleCommand(t);
+    };
+    rec.onerror = function () {
+      if (!got) { busy = false; var m = 'শুনতে পাইনি। আবার দুইবার ট্যাপ করুন।'; show(m, ''); speak(m); }
+    };
+    rec.onend = function () {
+      if (!got && busy) { busy = false; show('আবার কথা বলতে দুইবার ট্যাপ করুন', ''); }
+    };
+    try { rec.start(); } catch (e) { busy = false; }
+  }
+
+  /* ---------- SOS ---------- */
+  function sos() {
+    buzz([200, 100, 200, 100, 400]);
+    var num = load('guardian', '');
+    if (!num) {
+      var m = 'অভিভাবকের নম্বর দেওয়া নেই।';
+      show('SOS ত্রুটি', m, true); speak(m); return;
+    }
+    speechSynthesis.cancel();
+    show('SOS: অবস্থান খুঁজছি', '', true);
+    speak('এসওএস। অবস্থান খুঁজছি');
+    if (!navigator.geolocation) { sendSms(num, null); return; }
+    navigator.geolocation.getCurrentPosition(
+      function (p) { sendSms(num, p.coords); },
+      function () { sendSms(num, null); },
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 10000 }
+    );
+  }
+  function sendSms(num, c) {
+    var text = 'জরুরি সাহায্য দরকার! ';
+    text += c ? 'আমার অবস্থান: https://www.google.com/maps?q=' + c.latitude + ',' + c.longitude
+              : 'অবস্থান পাওয়া যায়নি, দয়া করে ফোন করুন।';
+    speak('মেসেজ তৈরি হয়েছে। মেসেজ অ্যাপে পাঠান বাটনে ট্যাপ করুন।');
+    window.location.href = 'sms:' + num + '?body=' + encodeURIComponent(text);
+  }
+
+  /* ---------- ট্যাপ ও লং প্রেস ---------- */
+  var downAt = 0, pressTimer = null, longFired = false, lastTap = 0;
+  var stage = document.body;
+  stage.addEventListener('pointerdown', function (e) {
+    if (e.target.closest('#settings') || e.target.closest('#top')) return;
+    downAt = Date.now(); longFired = false;
+    pressTimer = setTimeout(function () { longFired = true; sos(); }, 1500);
+  });
+  stage.addEventListener('pointerup', function (e) {
+    if (e.target.closest('#settings') || e.target.closest('#top')) return;
+    clearTimeout(pressTimer);
+    if (longFired || Date.now() - downAt > 500) return;
+    var now = Date.now();
+    if (now - lastTap < 400) {
+      lastTap = 0;
+      if (busy) { speechSynthesis.cancel(); busy = false; }
+      listen();
+    } else { lastTap = now; }
+  });
+  stage.addEventListener('pointercancel', function () { clearTimeout(pressTimer); });
+
+  /* ---------- সেটিংস ---------- */
+  $('openSettings').addEventListener('click', function () {
+    $('apiKey').value = load('apiKey', '');
+    $('model').value = load('model', DEFAULT_MODEL);
+    $('guardian').value = load('guardian', '');
+    $('settings').classList.add('open');
+  });
+  $('save').addEventListener('click', function () {
+    store('apiKey', $('apiKey').value.trim());
+    store('model', $('model').value.trim() || DEFAULT_MODEL);
+    store('guardian', $('guardian').value.trim());
+    $('settings').classList.remove('open');
+    speak('সংরক্ষণ করা হয়েছে');
+  });
+
+  /* ---------- শুরুতে ---------- */
+  window.addEventListener('load', function () {
+    setTimeout(function () { speak('দৃষ্টি সহায়ক চালু। কথা বলতে স্ক্রিনে দুইবার ট্যাপ করুন। বিপদে স্ক্রিন চেপে ধরে রাখুন।'); }, 600);
+  });
+})();
+</script>
+</body>
+</html>
